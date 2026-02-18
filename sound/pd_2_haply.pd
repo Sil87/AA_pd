@@ -25,8 +25,8 @@
 #X floatatom 1063 468 5 0 0 0 - - - 0;
 #X obj 1151 440 expr $f1/1000;
 #X obj 257 294 sig~ 20000;
-#X msg 770 543 connect 192.168.0.4 3000;
 #X msg 106 107 open emanuel.wav;
+#X msg 770 543 connect 10.42.0.1 3000;
 #X connect 1 0 23 0;
 #X connect 2 0 21 0;
 #X connect 4 0 21 0;
@@ -43,6 +43,6 @@
 #X connect 23 0 22 0;
 #X connect 24 0 0 0;
 #X connect 25 0 17 1;
-#X connect 26 0 21 0;
-#X connect 27 0 14 0;
+#X connect 26 0 14 0;
+#X connect 27 0 21 0;
 #X coords 0 0 0.5 0.5 0 0 0;

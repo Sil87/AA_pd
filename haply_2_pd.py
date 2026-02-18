@@ -25,7 +25,7 @@ saturation = 8.0
 # -------------------
 com_ports = list(serial.tools.list_ports.comports())
 if len(com_ports) == 1:
-    port1 = "/dev/ttyS0"
+    port1 = "/dev/ttyACM0"
 else:
     print("Select the COM port for the Haply board:")
     for i, port in enumerate(com_ports):
