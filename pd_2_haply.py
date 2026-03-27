@@ -1,5 +1,7 @@
-from pyhapi import Board, Device, Mechanisms
-from pantograph import Pantograph
+#from pyhapi import Board, Device, Mechanisms 
+#from pantograph import Pantograph
+from HaplyHAPI import Board, Device, Mechanisms, Pantograph
+
 import time
 import serial.tools.list_ports
 import signal
