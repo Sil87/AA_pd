@@ -32,8 +32,10 @@ import struct
 import argparse
 import serial.tools.list_ports
 
-from pyhapi import Board, Device, Mechanisms
-from pantograph import Pantograph
+#from pyhapi import Board, Device, Mechanisms
+#from pantograph import Pantograph
+from HaplyHAPI import Board, Device, Mechanisms, Pantograph
+
 
 
 # ============================================================

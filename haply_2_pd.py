@@ -3,8 +3,9 @@ import signal
 import sys
 import serial.tools.list_ports
 import threading
-from pyhapi import Board, Device, Mechanisms
-from pantograph import Pantograph
+from HaplyHAPI import Board, Device, Mechanisms, Pantograph
+#from pantograph import Pantograph
+#from pyhapi import Board, Device, Mechanisms
 from pythonosc import udp_client
 
 # -------------------
