@@ -1,7 +1,9 @@
 **Wifi setup**
+
 ***Raspberry 5*** : 
 - Attuned connexion :IP Fixe 192.168.0.7
 - Hotspot : SSID : rpi-danse-WIFI password : rpidanse
+  
 ***Raspberry 4b*** :
 - Attuned connexion :IP Fixe 192.168.0.4 or attuned4.local
 - Hotspot : SSID : rpi-danse-WIFI4 password : rpidanse
