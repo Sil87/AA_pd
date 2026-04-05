@@ -180,7 +180,7 @@ def main():
     parser.add_argument(
         "--slave-ip",
         type=str,
-        default="10.42.0.254",
+        default="10.42.0.42",
         help="Adresse IP du SLAVE (requis si --role=master)",
     )
     args = parser.parse_args()
