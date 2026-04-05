@@ -17,10 +17,10 @@ Lancement :
     PC dynamique →  python teleop_dyad.py --role dynamic
 
 Logique de téleopération :
-    • Chaque robot mesure sa propre position (x, y).
-    • Il envoie cette position à l'autre machine par UDP.
-    • Il reçoit la position de l'autre robot et l'utilise comme consigne.
-    • Une force proportionnelle (P) ramène le robot local vers la consigne.
+    • Chaque robot mesure ses angles articulaires (th1, th2).
+    • Il envoie ces angles à l'autre machine par UDP.
+    • Il reçoit les angles de l'autre robot et les utilise comme consigne.
+    • Un couple proportionnel-dérivé (PD) articulaire ramène le robot local vers la consigne.
 """
 
 import time
@@ -32,10 +32,9 @@ import struct
 import argparse
 import serial.tools.list_ports
 
-#from pyhapi import Board, Device, Mechanisms
-#from pantograph import Pantograph
+# from pyhapi import Board, Device, Mechanisms
+# from pantograph import Pantograph
 from HaplyHAPI import Board, Device, Mechanisms, Pantograph
-
 
 
 # ============================================================
@@ -55,8 +54,9 @@ CW = 0
 CCW = 1
 HARDWARE_VERSION = 3
 
-KP = 400.0  # Gain proportionnel [N/m]
-SATURATION = 8.0  # Saturation des forces [N]
+KP_ANGLE = 0.08  # Gain proportionnel articulaire [N.m/deg]
+KD_ANGLE = 0.002  # Gain dérivé articulaire [N.m.s/deg]
+SATURATION_TORQUE = 0.7  # Saturation des couples [N.m]
 LOOP_DT = 0.005  # Période de la boucle principale [s]  ~200 Hz
 
 
@@ -64,8 +64,8 @@ LOOP_DT = 0.005  # Période de la boucle principale [s]  ~200 Hz
 # État partagé (protégé par un verrou)
 # ============================================================
 _lock = threading.Lock()
-local_position = [0.0, 0.0]  # Position mesurée du robot local
-remote_position = [0.0, 0.0]  # Position reçue du robot distant (= consigne)
+local_angles = [0.0, 0.0]  # Angles mesurés du robot local
+remote_angles = [0.0, 0.0]  # Angles reçus du robot distant (= consigne)
 remote_addr = None  # (ip, port) du pair distant
 
 
@@ -114,7 +114,7 @@ def select_port() -> str:
 # ============================================================
 def udp_receiver(sock: socket.socket) -> None:
     """
-    Reçoit les positions UDP du robot distant.
+    Reçoit les angles UDP du robot distant.
     Enregistre automatiquement l'adresse du pair lors du premier paquet reçu
     (mécanisme d'enregistrement dynamique).
     """
@@ -127,8 +127,8 @@ def udp_receiver(sock: socket.socket) -> None:
             if len(data) == MSG_SIZE:
                 x, y = struct.unpack(MSG_FORMAT, data)
                 with _lock:
-                    remote_position[0] = x
-                    remote_position[1] = y
+                    remote_angles[0] = x
+                    remote_angles[1] = y
                     # Enregistrement du pair (IP dynamique autodécouverte)
                     if remote_addr is None:
                         remote_addr = addr
@@ -144,7 +144,7 @@ def udp_receiver(sock: socket.socket) -> None:
 # ============================================================
 def udp_sender(sock: socket.socket, role: str) -> None:
     """
-    Envoie en continu la position locale au pair distant.
+    Envoie en continu les angles locaux au pair distant.
 
     Stratégie d'adressage :
     - "fixed"   : attend que le pair dynamic s'enregistre, puis répond.
@@ -158,7 +158,7 @@ def udp_sender(sock: socket.socket, role: str) -> None:
     while True:
         try:
             with _lock:
-                pos = local_position[:]
+                ang = local_angles[:]
                 peer = remote_addr
 
             # Le PC dynamic envoie vers l'IP fixe tant qu'aucun pair n'est connu
@@ -172,7 +172,7 @@ def udp_sender(sock: socket.socket, role: str) -> None:
             else:
                 dest = (peer[0], LISTEN_PORT)
 
-            data = struct.pack(MSG_FORMAT, pos[0], pos[1])
+            data = struct.pack(MSG_FORMAT, ang[0], ang[1])
             sock.sendto(data, dest)
 
         except Exception as exc:
@@ -187,7 +187,7 @@ def udp_sender(sock: socket.socket, role: str) -> None:
 def make_signal_handler(device, sock):
     def handler(sig, frame):
         print("\n[Info] Arrêt demandé – mise à zéro des forces...")
-        device.set_device_torques([0.0, 0.0])
+        device.set_device_joint_torques([0.0, 0.0])
         device.device_write_torques()
         sock.close()
         time.sleep(0.1)
@@ -200,7 +200,7 @@ def make_signal_handler(device, sock):
 # Boucle principale
 # ============================================================
 def main():
-    global local_position, FIXED_IP
+    global local_angles, FIXED_IP
 
     # --- Arguments de ligne de commande ---
     parser = argparse.ArgumentParser(
@@ -243,7 +243,9 @@ def main():
     # --- Variables de boucle ---
     offset = [0.0, 0.0]
     offset_ok = False
-    forces = [0.0, 0.0]
+    joint_torques = [0.0, 0.0]
+    prev_error = [0.0, 0.0]
+    prev_error_ok = False
 
     role_label = f"IP fixe ({FIXED_IP})" if args.role == "fixed" else "IP dynamique"
     print(f"\n[Téléop] Boucle démarrée – rôle : {role_label}")
@@ -258,45 +260,62 @@ def main():
             if haplyBoard.data_available():
                 device.device_read_data()
                 angles = device.get_device_angles()
-                pos = device.get_device_position(angles)
+                a0 = angles[0]
+                a1 = angles[1]
+                if a0 is None or a1 is None:
+                    continue
+                angles_meas = [float(a0), float(a1)]
 
-                # Calibration : offset positionnel au premier passage
+                # Calibration : offset angulaire au premier passage
                 if not offset_ok:
-                    offset = list(pos)
+                    offset = list(angles_meas)
                     offset_ok = True
-                    print("[Robot] Offset de position enregistré.")
+                    prev_error_ok = False
+                    print("[Robot] Offset angulaire enregistré.")
 
-                pos_rel = [
-                    pos[0] - offset[0],
-                    pos[1] - offset[1],
+                angles_rel = [
+                    angles_meas[0] - offset[0],
+                    angles_meas[1] - offset[1],
                 ]
 
-                # Mise à jour de la position locale partagée
+                # Mise à jour des angles locaux partagés
                 with _lock:
-                    local_position[0] = pos_rel[0]
-                    local_position[1] = pos_rel[1]
-                    target = remote_position[:]
+                    local_angles[0] = angles_rel[0]
+                    local_angles[1] = angles_rel[1]
+                    target = remote_angles[:]
 
-                # Loi de commande proportionnelle
-                fx = (target[0] - pos_rel[0]) * KP
-                fy = (target[1] - pos_rel[1]) * KP
-                forces[0] = max(min(fx, SATURATION), -SATURATION)
-                forces[1] = max(min(fy, SATURATION), -SATURATION)
+                # Loi de commande PD en espace articulaire
+                error = [target[0] - angles_rel[0], target[1] - angles_rel[1]]
+                if prev_error_ok:
+                    d_error = [
+                        (error[0] - prev_error[0]) / LOOP_DT,
+                        (error[1] - prev_error[1]) / LOOP_DT,
+                    ]
+                else:
+                    d_error = [0.0, 0.0]
+                    prev_error_ok = True
+
+                tau1 = KP_ANGLE * error[0] + KD_ANGLE * d_error[0]
+                tau2 = KP_ANGLE * error[1] + KD_ANGLE * d_error[1]
+                joint_torques[0] = max(min(tau1, SATURATION_TORQUE), -SATURATION_TORQUE)
+                joint_torques[1] = max(min(tau2, SATURATION_TORQUE), -SATURATION_TORQUE)
+                prev_error[0] = error[0]
+                prev_error[1] = error[1]
 
                 print(
-                    f"local=({pos_rel[0]:+.4f}, {pos_rel[1]:+.4f})  "
+                    f"ang_local=({angles_rel[0]:+.4f}, {angles_rel[1]:+.4f})  "
                     f"cible=({target[0]:+.4f}, {target[1]:+.4f})  "
-                    f"F=({forces[0]:+.2f}, {forces[1]:+.2f}) N"
+                    f"tau=({joint_torques[0]:+.3f}, {joint_torques[1]:+.3f}) N.m"
                 )
 
-            device.set_device_torques(forces)
+            device.set_device_joint_torques(joint_torques)
             device.device_write_torques()
             time.sleep(LOOP_DT)
 
         except Exception as exc:
             print(f"[Boucle] Erreur : {exc}")
-            forces = [0.0, 0.0]
-            device.set_device_torques(forces)
+            joint_torques = [0.0, 0.0]
+            device.set_device_joint_torques(joint_torques)
             device.device_write_torques()
             time.sleep(0.1)
 

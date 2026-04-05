@@ -11,9 +11,9 @@ Lancement :
     Robot SLAVE  →  python teleop_master_slave.py --role slave
 
 Logique :
-    • Le MASTER mesure sa position et l'envoie par UDP au SLAVE.
-    • Le SLAVE reçoit cette position et applique une force pour la suivre.
-    • Le MASTER n'a aucune retro-action (force de retour).
+    • Le MASTER mesure ses angles articulaires et les envoie au SLAVE.
+    • Le SLAVE reçoit ces angles et applique un couple PD articulaire pour les suivre.
+    • Le MASTER n'a aucune retro-action (couple de retour).
 """
 
 import time
@@ -44,8 +44,9 @@ CW = 0
 CCW = 1
 HARDWARE_VERSION = 3
 
-KP = 400.0  # Gain proportionnel [N/m]
-SATURATION = 8.0  # Saturation des forces [N]
+KP_ANGLE = 0.08  # Gain proportionnel articulaire [N.m/deg]
+KD_ANGLE = 0.002  # Gain dérivé articulaire [N.m.s/deg]
+SATURATION_TORQUE = 0.7  # Saturation des couples [N.m]
 LOOP_DT = 0.005  # Période de la boucle principale [s]  ~200 Hz
 
 
@@ -53,8 +54,8 @@ LOOP_DT = 0.005  # Période de la boucle principale [s]  ~200 Hz
 # État partagé (protégé par un verrou)
 # ============================================================
 _lock = threading.Lock()
-local_position = [0.0, 0.0]  # Position mesurée du robot local
-remote_position = [0.0, 0.0]  # Position reçue du robot distant (= consigne pour SLAVE)
+local_angles = [0.0, 0.0]  # Angles mesurés du robot local
+remote_angles = [0.0, 0.0]  # Angles reçus du robot distant (= consigne pour SLAVE)
 
 
 # ============================================================
@@ -102,7 +103,7 @@ def select_port() -> str:
 # ============================================================
 def udp_sender_master(sock: socket.socket, slave_ip: str) -> None:
     """
-    MASTER : envoie en continu sa position au SLAVE.
+    MASTER : envoie en continu ses angles au SLAVE.
     """
     slave_addr = (slave_ip, LISTEN_PORT)
     print(f"[UDP] MASTER prêt à envoyer vers {slave_ip}:{LISTEN_PORT}")
@@ -110,9 +111,9 @@ def udp_sender_master(sock: socket.socket, slave_ip: str) -> None:
     while True:
         try:
             with _lock:
-                pos = local_position[:]
+                ang = local_angles[:]
 
-            data = struct.pack(MSG_FORMAT, pos[0], pos[1])
+            data = struct.pack(MSG_FORMAT, ang[0], ang[1])
             sock.sendto(data, slave_addr)
 
         except Exception as exc:
@@ -126,7 +127,7 @@ def udp_sender_master(sock: socket.socket, slave_ip: str) -> None:
 # ============================================================
 def udp_receiver_slave(sock: socket.socket) -> None:
     """
-    SLAVE : reçoit la position du MASTER et la met à jour.
+    SLAVE : reçoit les angles du MASTER et les met à jour.
     """
     print(f"[UDP] SLAVE en écoute sur le port {LISTEN_PORT}...")
     while True:
@@ -135,8 +136,8 @@ def udp_receiver_slave(sock: socket.socket) -> None:
             if len(data) == MSG_SIZE:
                 x, y = struct.unpack(MSG_FORMAT, data)
                 with _lock:
-                    remote_position[0] = x
-                    remote_position[1] = y
+                    remote_angles[0] = x
+                    remote_angles[1] = y
                 # Affichage occasionnel de la position reçue
                 # (optionnel, peut ralentir le système)
 
@@ -152,7 +153,7 @@ def udp_receiver_slave(sock: socket.socket) -> None:
 def make_signal_handler(device, sock):
     def handler(sig, frame):
         print("\n[Info] Arrêt demandé – mise à zéro des forces...")
-        device.set_device_torques([0.0, 0.0])
+        device.set_device_joint_torques([0.0, 0.0])
         device.device_write_torques()
         sock.close()
         time.sleep(0.1)
@@ -165,7 +166,7 @@ def make_signal_handler(device, sock):
 # Boucle principale
 # ============================================================
 def main():
-    global local_position, remote_position
+    global local_angles, remote_angles
 
     # --- Arguments de ligne de commande ---
     parser = argparse.ArgumentParser(
@@ -210,7 +211,9 @@ def main():
     # --- Variables de boucle ---
     offset = [0.0, 0.0]
     offset_ok = False
-    forces = [0.0, 0.0]
+    joint_torques = [0.0, 0.0]
+    prev_error = [0.0, 0.0]
+    prev_error_ok = False
 
     print(f"\n[Téléop] Boucle démarrée – rôle : {role_label}")
 
@@ -220,59 +223,81 @@ def main():
             if haplyBoard.data_available():
                 device.device_read_data()
                 angles = device.get_device_angles()
-                pos = device.get_device_position(angles)
+                a0 = angles[0]
+                a1 = angles[1]
+                if a0 is None or a1 is None:
+                    continue
+                angles_meas = [float(a0), float(a1)]
 
-                # Calibration : offset positionnel au premier passage
+                # Calibration : offset angulaire au premier passage
                 if not offset_ok:
-                    offset = list(pos)
+                    offset = list(angles_meas)
                     offset_ok = True
-                    print("[Robot] Offset de position enregistré.")
+                    prev_error_ok = False
+                    print("[Robot] Offset angulaire enregistré.")
 
-                pos_rel = [
-                    pos[0] - offset[0],
-                    pos[1] - offset[1],
+                angles_rel = [
+                    angles_meas[0] - offset[0],
+                    angles_meas[1] - offset[1],
                 ]
 
-                # Mise à jour de la position locale partagée
+                # Mise à jour des angles locaux partagés
                 with _lock:
-                    local_position[0] = pos_rel[0]
-                    local_position[1] = pos_rel[1]
+                    local_angles[0] = angles_rel[0]
+                    local_angles[1] = angles_rel[1]
 
                 if args.role == "master":
                     # ========== MASTER ==========
-                    # Le master ne fait rien, juste envoie sa position par UDP
+                    # Le master ne fait rien, il envoie seulement ses angles par UDP
                     print(
-                        f"[MASTER] pos=({pos_rel[0]:+.4f}, {pos_rel[1]:+.4f})  "
-                        f"F=(0.00, 0.00) N"
+                        f"[MASTER] ang=({angles_rel[0]:+.4f}, {angles_rel[1]:+.4f})  "
+                        f"tau=(0.000, 0.000) N.m"
                     )
-                    forces = [0.0, 0.0]
+                    joint_torques = [0.0, 0.0]
+                    prev_error_ok = False
 
                 else:
                     # ========== SLAVE ==========
-                    # Le slave suit la position reçue du master
+                    # Le slave suit les angles reçus du master
                     with _lock:
-                        target = remote_position[:]
+                        target = remote_angles[:]
 
-                    # Loi de commande proportionnelle
-                    fx = (target[0] - pos_rel[0]) * KP
-                    fy = (target[1] - pos_rel[1]) * KP
-                    forces[0] = max(min(fx, SATURATION), -SATURATION)
-                    forces[1] = max(min(fy, SATURATION), -SATURATION)
+                    # Loi de commande PD en espace articulaire
+                    error = [target[0] - angles_rel[0], target[1] - angles_rel[1]]
+                    if prev_error_ok:
+                        d_error = [
+                            (error[0] - prev_error[0]) / LOOP_DT,
+                            (error[1] - prev_error[1]) / LOOP_DT,
+                        ]
+                    else:
+                        d_error = [0.0, 0.0]
+                        prev_error_ok = True
+
+                    tau1 = KP_ANGLE * error[0] + KD_ANGLE * d_error[0]
+                    tau2 = KP_ANGLE * error[1] + KD_ANGLE * d_error[1]
+                    joint_torques[0] = max(
+                        min(tau1, SATURATION_TORQUE), -SATURATION_TORQUE
+                    )
+                    joint_torques[1] = max(
+                        min(tau2, SATURATION_TORQUE), -SATURATION_TORQUE
+                    )
+                    prev_error[0] = error[0]
+                    prev_error[1] = error[1]
 
                     print(
-                        f"[SLAVE]  pos=({pos_rel[0]:+.4f}, {pos_rel[1]:+.4f})  "
+                        f"[SLAVE]  ang=({angles_rel[0]:+.4f}, {angles_rel[1]:+.4f})  "
                         f"cible=({target[0]:+.4f}, {target[1]:+.4f})  "
-                        f"F=({forces[0]:+.2f}, {forces[1]:+.2f}) N"
+                        f"tau=({joint_torques[0]:+.3f}, {joint_torques[1]:+.3f}) N.m"
                     )
 
-            device.set_device_torques(forces)
+            device.set_device_joint_torques(joint_torques)
             device.device_write_torques()
             time.sleep(LOOP_DT)
 
         except Exception as exc:
             print(f"[Boucle] Erreur : {exc}")
-            forces = [0.0, 0.0]
-            device.set_device_torques(forces)
+            joint_torques = [0.0, 0.0]
+            device.set_device_joint_torques(joint_torques)
             device.device_write_torques()
             time.sleep(0.1)
 
